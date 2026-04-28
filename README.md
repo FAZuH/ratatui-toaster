@@ -1,6 +1,7 @@
 # ratatui-toaster
 
-> [!NOTE] This repo is a fork from a subcrate at https://github.com/JayanAXHF/gitv
+> [!note]
+> This repo is a fork from a subcrate at https://github.com/JayanAXHF/gitv
 
 `ratatui-toaster` is an extremely lightweight (under 300 LoC) library for displaying toast notifications in terminal applications built with Ratatui. It provides a simple API for showing transient messages to users, enhancing the user experience without overwhelming them with information.
 
