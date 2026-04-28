@@ -31,12 +31,22 @@ use textwrap::wrap;
 use crate::widget::Toast;
 
 const DEFAULT_MAX_TOAST_WIDTH: u16 = 50;
+const TOAST_GAP: u16 = 1;
 
 /// A toast engine for displaying temporary messages in a terminal UI.
 /// The `ToastEngine` manages the display of toasts, which are temporary messages that appear on the screen for a short duration. It supports different types of toasts (info, success, warning, error) and allows customization of their position and duration.
 /// You can call `show_toast` to display a toast, and `hide_toast` to hide the toast. To animate,
 /// you can get the area of the toast using `toast_area` and implement your animation logic based on that area. #[derive(Debug)]
 /// Caveat: If you're not using the `tokio` feature, create a `ToastEngine<()>`. There is a (hacky) impl to make it work without the `tokio` feature.
+/// An active toast with its render state.
+#[derive(Debug)]
+struct ActiveToast {
+    toast: Toast,
+    area: Rect,
+    position: ToastPosition,
+    constraint: ToastConstraint,
+}
+
 pub struct ToastEngine<A>
 where
     A: From<ToastMessage> + Send + 'static,
@@ -48,7 +58,7 @@ where
     #[cfg(not(feature = "tokio"))]
     tx: Option<PhantomData<A>>,
     toast_area: Rect,
-    current_toast: Option<Toast>,
+    toasts: Vec<ActiveToast>,
 }
 
 /// A builder for creating a `ToastEngine`. It allows you to set the default duration for toasts, and an optional channel sender for sending toast messages (if using the `tokio` feature).
@@ -118,7 +128,7 @@ pub enum ToastPosition {
 }
 
 /// The constraint for the toast's size. This enum defines how the size of the toast should be determined. The `Auto` variant allows the toast to automatically size itself based on the message content, while the `Uniform` and `Manual` variants allow for more specific control over the width and height of the toast.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub enum ToastConstraint {
     #[default]
     Auto,
@@ -168,7 +178,7 @@ where
             area,
             default_duration,
             tx,
-            current_toast: None,
+            toasts: Vec::new(),
             toast_area: Rect::default(),
         }
     }
@@ -186,17 +196,39 @@ where
             area,
             default_duration,
             tx,
-            current_toast: None,
+            toasts: Vec::new(),
             toast_area: Rect::default(),
         }
     }
 
-    /// Shows a toast message using the provided `ToastBuilder`. This method calculates the area for the toast based on the message content and the specified position, creates a new `Toast` instance, and sets it as the current toast to be rendered. If the `tokio` feature is enabled and a channel sender is configured, it also spawns a task to automatically hide the toast after the default duration.
+    /// Shows a toast message using the provided `ToastBuilder`. This method calculates the area for the toast based on the message content and the specified position, creates a new `Toast` instance, and adds it to the stack of active toasts. Older toasts are pushed down (for top and center positions) or up (for bottom positions) to make room for the new one. If the `tokio` feature is enabled and a channel sender is configured, it also spawns a task to automatically hide the toast after the default duration.
     pub fn show_toast(&mut self, toast: ToastBuilder) {
         let toast_area = calculate_toast_area(&toast, self.area);
+
+        // Shift existing toasts to make room for the new one.
+        let shift = toast_area.height + TOAST_GAP;
+        match toast.position {
+            ToastPosition::TopLeft | ToastPosition::TopRight | ToastPosition::Center => {
+                for active in &mut self.toasts {
+                    active.area.y = active.area.y.saturating_add(shift);
+                }
+            }
+            ToastPosition::BottomLeft | ToastPosition::BottomRight => {
+                for active in &mut self.toasts {
+                    active.area.y = active.area.y.saturating_sub(shift);
+                }
+            }
+        }
+
+        let toast_widget = Toast::new(&toast.message, toast.toast_type);
+        self.toasts.push(ActiveToast {
+            toast: toast_widget,
+            area: toast_area,
+            position: toast.position,
+            constraint: toast.constraint,
+        });
         self.toast_area = toast_area;
-        let toast = Toast::new(&toast.message, toast.toast_type);
-        self.current_toast = Some(toast);
+
         #[cfg(feature = "tokio")]
         if let Some(tx) = &self.tx {
             let tx_clone = tx.clone();
@@ -208,24 +240,56 @@ where
         }
     }
 
-    /// Get the area where the toast will be rendered.
+    /// Get the area where the most recent toast will be rendered.
     pub fn toast_area(&self) -> Rect {
         self.toast_area
     }
 
-    /// Whether a toast is currently being displayed.
+    /// Whether any toast is currently being displayed.
     pub fn has_toast(&self) -> bool {
-        self.current_toast.is_some()
+        !self.toasts.is_empty()
     }
 
-    /// Hides the currently displayed toast, if any. This method sets the current toast to `None`, which will cause it to no longer be rendered on the screen.
+    /// Hides the oldest displayed toast, if any. When using the `tokio` feature, this is typically called in response to a `ToastMessage::Hide` event, which is sent automatically when the toast duration expires.
     pub fn hide_toast(&mut self) {
-        self.current_toast = None;
+        if !self.toasts.is_empty() {
+            self.toasts.remove(0);
+        }
+        self.toast_area = self.toasts.last().map(|t| t.area).unwrap_or_default();
     }
 
-    /// Sets the area for the toast engine. This method allows you to update the area where toasts will be displayed, which can be useful if the layout of your terminal UI changes and you need to adjust the toast display area accordingly.
+    /// Sets the area for the toast engine and recalculates positions for all active toasts. This method allows you to update the area where toasts will be displayed, which can be useful if the layout of your terminal UI changes and you need to adjust the toast display area accordingly.
     pub fn set_area(&mut self, area: Rect) {
         self.area = area;
+        self.recalculate_areas();
+    }
+
+    fn recalculate_areas(&mut self) {
+        let mut top_y = self.area.y;
+        let mut bottom_y = self.area.y.saturating_add(self.area.height);
+
+        for active in self.toasts.iter_mut().rev() {
+            let builder = ToastBuilder::new(Cow::Owned(active.toast.message.clone()))
+                .position(active.position)
+                .constraint(active.constraint.clone());
+            let mut new_area = calculate_toast_area(&builder, self.area);
+            drop(builder);
+
+            match active.position {
+                ToastPosition::TopLeft | ToastPosition::TopRight | ToastPosition::Center => {
+                    new_area.y = top_y;
+                    top_y = top_y.saturating_add(new_area.height + TOAST_GAP);
+                }
+                ToastPosition::BottomLeft | ToastPosition::BottomRight => {
+                    bottom_y = bottom_y.saturating_sub(new_area.height + TOAST_GAP);
+                    new_area.y = bottom_y;
+                }
+            }
+
+            active.area = new_area;
+        }
+
+        self.toast_area = self.toasts.last().map(|t| t.area).unwrap_or_default();
     }
 }
 
@@ -341,10 +405,10 @@ where
     A: From<ToastMessage> + Send + 'static,
 {
     fn render_ref(&self, _area: Rect, buf: &mut ratatui::buffer::Buffer) {
-        if self.current_toast.is_some() {
-            Clear.render(self.toast_area, buf);
+        for active in &self.toasts {
+            Clear.render(active.area, buf);
+            active.toast.render_ref(active.area, buf);
         }
-        self.current_toast.render_ref(self.toast_area, buf);
     }
 }
 
