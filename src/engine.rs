@@ -291,7 +291,7 @@ where
         let mut bottom_y = self.area.y.saturating_add(self.area.height);
 
         for active in self.toasts.iter_mut().rev() {
-            let builder = ToastBuilder::new(Cow::Owned(active.toast.message.clone()))
+            let builder = ToastBuilder::new(Cow::Owned(active.toast.display_text()))
                 .position(active.position)
                 .constraint(active.constraint.clone());
             let mut new_area = calculate_toast_area(&builder, self.area);
