@@ -6,6 +6,7 @@
 //! The `tokio` feature can be used to tightly integrate the toast engine with applications that use an event based pattern. In your
 //! `Action` enum (or equivalent), add a variant that can be converted from `ToastMessage`. For example:
 //! ```rust
+//! # use ratatui_toaster::ToastMessage;
 //! enum Action {
 //!     ShowToast(ToastMessage),
 //!     // other variants...
@@ -152,13 +153,14 @@ pub enum ToastMessage {
     Hide,
 }
 
-/// A builder for creating a toast message. This struct allows you to specify the message content, type, position, and size constraints for a toast before showing it using the `ToastEngine`. The builder pattern provides a convenient way to configure the properties of a toast in a fluent manner.
+/// A builder for creating a toast message. This struct allows you to specify the message content, type, position, size constraints, and deduplication behavior for a toast before showing it using the `ToastEngine`. The builder pattern provides a convenient way to configure the properties of a toast in a fluent manner.
 #[derive(Debug, Default)]
 pub struct ToastBuilder {
     message: Cow<'static, str>,
     toast_type: ToastType,
     position: ToastPosition,
     constraint: ToastConstraint,
+    deduplicate: bool,
 }
 
 impl<A> ToastEngine<A>
@@ -203,6 +205,25 @@ where
 
     /// Shows a toast message using the provided `ToastBuilder`. This method calculates the area for the toast based on the message content and the specified position, creates a new `Toast` instance, and adds it to the stack of active toasts. Older toasts are pushed down (for top and center positions) or up (for bottom positions) to make room for the new one. If the `tokio` feature is enabled and a channel sender is configured, it also spawns a task to automatically hide the toast after the default duration.
     pub fn show_toast(&mut self, toast: ToastBuilder) {
+        // Deduplicate: increment count on existing toast with matching message.
+        if toast.deduplicate
+            && let Some(existing) = self
+                .toasts
+                .iter_mut()
+                .find(|t| t.toast.message == *toast.message)
+        {
+            existing.toast.increment_count();
+            // Recalculate area using display_text() so "(xN)" suffix fits
+            let display = existing.toast.display_text();
+            existing.area = calculate_toast_area(
+                &ToastBuilder::new(Cow::Owned(display))
+                    .position(existing.position)
+                    .constraint(existing.constraint.clone()),
+                self.area,
+            );
+            return;
+        }
+
         let toast_area = calculate_toast_area(&toast, self.area);
 
         // Shift existing toasts to make room for the new one.
@@ -252,10 +273,11 @@ where
 
     /// Hides the oldest displayed toast, if any. When using the `tokio` feature, this is typically called in response to a `ToastMessage::Hide` event, which is sent automatically when the toast duration expires.
     pub fn hide_toast(&mut self) {
-        if !self.toasts.is_empty() {
-            self.toasts.remove(0);
+        if self.toasts.is_empty() {
+            return;
         }
-        self.toast_area = self.toasts.last().map(|t| t.area).unwrap_or_default();
+        self.toasts.remove(0);
+        self.recalculate_areas();
     }
 
     /// Sets the area for the toast engine and recalculates positions for all active toasts. This method allows you to update the area where toasts will be displayed, which can be useful if the layout of your terminal UI changes and you need to adjust the toast display area accordingly.
@@ -301,6 +323,7 @@ impl ToastBuilder {
             toast_type: ToastType::Info,
             position: ToastPosition::TopRight,
             constraint: ToastConstraint::Auto,
+            deduplicate: false,
         }
     }
 
@@ -316,6 +339,13 @@ impl ToastBuilder {
 
     pub fn constraint(mut self, constraint: ToastConstraint) -> Self {
         self.constraint = constraint;
+        self
+    }
+
+    /// If set to `true`, a toast with the same message as an existing toast will
+    /// increment a counter on the existing toast instead of adding a new one.
+    pub fn deduplicate(mut self, deduplicate: bool) -> Self {
+        self.deduplicate = deduplicate;
         self
     }
 }
@@ -406,9 +436,27 @@ where
 {
     fn render_ref(&self, _area: Rect, buf: &mut ratatui::buffer::Buffer) {
         for active in &self.toasts {
-            Clear.render(active.area, buf);
-            active.toast.render_ref(active.area, buf);
+            let area = clamp_rect(active.area, self.area);
+            if area.width == 0 || area.height == 0 {
+                continue;
+            }
+            Clear.render(area, buf);
+            active.toast.render_ref(area, buf);
         }
+    }
+}
+
+/// Clamp `inner` to be fully contained within `outer`.
+fn clamp_rect(inner: Rect, outer: Rect) -> Rect {
+    let x = inner.x.max(outer.x);
+    let y = inner.y.max(outer.y);
+    let max_x = (inner.x + inner.width).min(outer.x + outer.width);
+    let max_y = (inner.y + inner.height).min(outer.y + outer.height);
+    Rect {
+        x,
+        y,
+        width: max_x.saturating_sub(x),
+        height: max_y.saturating_sub(y),
     }
 }
 

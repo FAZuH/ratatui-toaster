@@ -11,6 +11,7 @@ use crate::engine::ToastType;
 pub struct Toast {
     pub message: String,
     pub type_: ToastType,
+    pub count: u32,
 }
 
 impl Toast {
@@ -19,6 +20,20 @@ impl Toast {
         Self {
             message: message.to_string(),
             type_,
+            count: 1,
+        }
+    }
+
+    /// Increment the duplicate count.
+    pub fn increment_count(&mut self) {
+        self.count += 1;
+    }
+
+    pub(crate) fn display_text(&self) -> String {
+        if self.count > 1 {
+            format!("{} (x{})", self.message, self.count)
+        } else {
+            self.message.clone()
         }
     }
 }
@@ -26,7 +41,7 @@ impl Toast {
 impl WidgetRef for Toast {
     fn render_ref(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
         const PADDING: u16 = 1;
-        let paragraph = Paragraph::new(self.message.as_str()).block(
+        let paragraph = Paragraph::new(self.display_text()).block(
             Block::default()
                 .borders(Borders::LEFT | Borders::RIGHT)
                 .border_set(symbols::border::QUADRANT_OUTSIDE)
