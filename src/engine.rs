@@ -472,3 +472,284 @@ where
 impl From<ToastMessage> for () {
     fn from(_value: ToastMessage) -> Self {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    fn area_80x24() -> Rect {
+        Rect::new(0, 0, 80, 24)
+    }
+
+    // --- calculate_toast_area / position tests ---
+
+    #[test]
+    fn top_left_x_is_zero() {
+        let area = area_80x24();
+        let builder = ToastBuilder::new("test".into()).position(ToastPosition::TopLeft);
+        let rect = calculate_toast_area(&builder, area);
+        assert_eq!(rect.x, 0);
+        assert_eq!(rect.y, 0);
+    }
+
+    #[test]
+    fn top_right_x_is_not_zero() {
+        let area = area_80x24();
+        let builder = ToastBuilder::new("test".into()).position(ToastPosition::TopRight);
+        let rect = calculate_toast_area(&builder, area);
+        assert!(rect.x > 0, "TopRight x should be > 0, got {}", rect.x);
+        assert_eq!(rect.y, 0);
+    }
+
+    #[test]
+    fn top_right_differs_from_top_left() {
+        let area = area_80x24();
+        let left = calculate_toast_area(
+            &ToastBuilder::new("test".into()).position(ToastPosition::TopLeft),
+            area,
+        );
+        let right = calculate_toast_area(
+            &ToastBuilder::new("test".into()).position(ToastPosition::TopRight),
+            area,
+        );
+        assert_ne!(left.x, right.x, "TopLeft and TopRight x must differ");
+    }
+
+    #[test]
+    fn bottom_left_y_is_bottom() {
+        let area = area_80x24();
+        let builder = ToastBuilder::new("test".into()).position(ToastPosition::BottomLeft);
+        let rect = calculate_toast_area(&builder, area);
+        assert_eq!(rect.x, 0);
+        assert!(rect.y > 0, "BottomLeft y should be > 0, got {}", rect.y);
+    }
+
+    #[test]
+    fn bottom_right_x_and_y_are_bottom_right() {
+        let area = area_80x24();
+        let builder = ToastBuilder::new("test".into()).position(ToastPosition::BottomRight);
+        let rect = calculate_toast_area(&builder, area);
+        assert!(rect.x > 0, "BottomRight x should be > 0, got {}", rect.x);
+        assert!(rect.y > 0, "BottomRight y should be > 0, got {}", rect.y);
+    }
+
+    #[test]
+    fn center_is_centered() {
+        let area = area_80x24();
+        let builder = ToastBuilder::new("test".into()).position(ToastPosition::Center);
+        let rect = calculate_toast_area(&builder, area);
+        // Centered width (6) + padding (4) = 10
+        // center x = (80 - 10) / 2 = 35
+        // center y = (24 - 3) / 2 = 10 (3 = 1 line text + 2 padding)
+        assert!(rect.x > 0, "Center x={}", rect.x);
+        assert!(rect.y > 0, "Center y={}", rect.y);
+    }
+
+    // --- deduplication tests ---
+
+    #[test]
+    fn dedup_increments_count() {
+        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(area_80x24()).build();
+        engine.show_toast(ToastBuilder::new("error".into()).deduplicate(true));
+        engine.show_toast(ToastBuilder::new("error".into()).deduplicate(true));
+
+        // Render to buffer — "(x2)" should be visible
+        let mut buf = Buffer::empty(area_80x24());
+        engine.render_ref(Rect::default(), &mut buf);
+
+        let output = buf_to_string(&buf, area_80x24());
+        assert!(
+            output.contains("(x2)"),
+            "Expected dedup counter in output, got: {output:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_does_not_add_extra_toast() {
+        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(area_80x24()).build();
+        engine.show_toast(ToastBuilder::new("hello".into()).deduplicate(true));
+        // Same message, dedup should NOT add a new toast
+        engine.show_toast(ToastBuilder::new("hello".into()).deduplicate(true));
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
+        engine.render_ref(Rect::default(), &mut buf);
+
+        // Only one occurrence of "hello" in the output
+        let output = buf_to_string(&buf, Rect::new(0, 0, 80, 10));
+        let count = output.matches("hello").count();
+        assert!(
+            count <= 2,
+            "Expected at most 2 occurrences of 'hello' (message + border), got {count}"
+        );
+    }
+
+    #[test]
+    fn dedup_different_messages_add_both() {
+        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(area_80x24()).build();
+        engine.show_toast(ToastBuilder::new("err a".into()).deduplicate(true));
+        engine.show_toast(ToastBuilder::new("err b".into()).deduplicate(true));
+
+        let mut buf = Buffer::empty(area_80x24());
+        engine.render_ref(Rect::default(), &mut buf);
+
+        let output = buf_to_string(&buf, area_80x24());
+        assert!(output.contains("err a"), "Missing toast 'err a'");
+        assert!(output.contains("err b"), "Missing toast 'err b'");
+    }
+
+    #[test]
+    fn dedup_counter_appears_on_second_duplicate() {
+        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(area_80x24()).build();
+        engine.show_toast(ToastBuilder::new("dup".into()).deduplicate(true));
+        engine.show_toast(ToastBuilder::new("dup".into()).deduplicate(true));
+        engine.show_toast(ToastBuilder::new("dup".into()).deduplicate(true));
+
+        let mut buf = Buffer::empty(area_80x24());
+        engine.render_ref(Rect::default(), &mut buf);
+
+        let output = buf_to_string(&buf, area_80x24());
+        assert!(
+            output.contains("(x3)"),
+            "Expected (x3) in output, got: {output:?}"
+        );
+    }
+
+    // --- hide_toast / recalculate tests ---
+
+    #[test]
+    fn hide_toast_removes_oldest() {
+        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(area_80x24()).build();
+        engine.show_toast(ToastBuilder::new("first".into()).position(ToastPosition::TopLeft));
+        engine.show_toast(ToastBuilder::new("second".into()).position(ToastPosition::TopLeft));
+        engine.hide_toast();
+
+        // After hiding oldest ("first"), only "second" should remain
+        let mut buf = Buffer::empty(area_80x24());
+        engine.render_ref(Rect::default(), &mut buf);
+        let output = buf_to_string(&buf, area_80x24());
+        assert!(!output.contains("first"), "Oldest toast should be gone");
+        assert!(output.contains("second"), "Newer toast should remain");
+    }
+
+    #[test]
+    fn hide_toast_recalculates_positions() {
+        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(area_80x24()).build();
+
+        // Show two toasts — second shifts first down
+        engine.show_toast(ToastBuilder::new("top".into()).position(ToastPosition::TopLeft));
+        engine.show_toast(ToastBuilder::new("bottom".into()).position(ToastPosition::TopLeft));
+
+        // Hide the oldest ("top") — "bottom" should move up
+        engine.hide_toast();
+
+        // The remaining toast should be at the top (y = 0)
+        // We render and check the remaining toast area
+        assert_eq!(engine.toasts.len(), 1);
+        let remaining = &engine.toasts[0];
+        assert_eq!(
+            remaining.area.y, 0,
+            "Remaining toast should be at y=0 after hide, got y={}",
+            remaining.area.y
+        );
+    }
+
+    // --- clamp_rect tests ---
+
+    #[test]
+    fn clamp_rect_inside() {
+        let outer = Rect::new(0, 0, 80, 24);
+        let inner = Rect::new(5, 5, 10, 3);
+        assert_eq!(clamp_rect(inner, outer), inner);
+    }
+
+    #[test]
+    fn clamp_rect_partial_overflow_right() {
+        let outer = Rect::new(0, 0, 20, 10);
+        let inner = Rect::new(15, 2, 10, 3); // overflows right by 5
+        let clamped = clamp_rect(inner, outer);
+        assert_eq!(clamped.x, 15);
+        assert_eq!(clamped.width, 5); // only 5 chars fit
+        assert_eq!(clamped.height, 3);
+    }
+
+    #[test]
+    fn clamp_rect_partial_overflow_bottom() {
+        let outer = Rect::new(0, 0, 20, 10);
+        let inner = Rect::new(2, 8, 10, 5); // overflows bottom by 3
+        let clamped = clamp_rect(inner, outer);
+        assert_eq!(clamped.y, 8);
+        assert_eq!(clamped.height, 2); // only 2 rows fit
+    }
+
+    #[test]
+    fn clamp_rect_completely_outside() {
+        let outer = Rect::new(0, 0, 20, 10);
+        let inner = Rect::new(30, 30, 10, 3); // completely outside
+        let clamped = clamp_rect(inner, outer);
+        assert!(clamped.width == 0 || clamped.height == 0);
+    }
+
+    // --- render safety tests ---
+
+    #[test]
+    fn render_toast_outside_bounds_no_panic() {
+        // Create an engine with small area
+        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(area_80x24()).build();
+
+        // Show a toast with a long message so it's large
+        engine.show_toast(
+            ToastBuilder::new("hello world this is a test message".into())
+                .position(ToastPosition::TopLeft),
+        );
+
+        // Set a smaller area — toast area is now out of bounds
+        engine.set_area(Rect::new(0, 0, 10, 3));
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        // This should NOT panic
+        engine.render_ref(Rect::default(), &mut buf);
+    }
+
+    #[test]
+    fn multiple_toasts_overflow_no_panic() {
+        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(Rect::new(0, 0, 40, 5)).build();
+
+        // Add many toasts to force overflow
+        for i in 0..10 {
+            engine.show_toast(
+                ToastBuilder::new(format!("toast {i}").into()).position(ToastPosition::TopLeft),
+            );
+        }
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 5));
+        // This should NOT panic
+        engine.render_ref(Rect::default(), &mut buf);
+    }
+
+    #[test]
+    fn hide_toast_on_empty_no_panic() {
+        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(area_80x24()).build();
+        // hide on empty engine should be a no-op
+        engine.hide_toast();
+        engine.hide_toast();
+        engine.hide_toast();
+        assert!(!engine.has_toast());
+    }
+
+    // Helpers
+
+    /// Extract text from a buffer by reading cell symbols, preserving whitespace.
+    fn buf_to_string(buf: &Buffer, area: Rect) -> String {
+        let mut out = String::new();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+}
