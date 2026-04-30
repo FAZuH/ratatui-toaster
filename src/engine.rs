@@ -22,6 +22,7 @@
 use std::borrow::Cow;
 #[cfg(not(feature = "tokio"))]
 use std::marker::PhantomData;
+use std::time::Instant;
 
 use ratatui::{
     layout::{Constraint, Rect, Size},
@@ -46,6 +47,7 @@ struct ActiveToast {
     area: Rect,
     position: ToastPosition,
     constraint: ToastConstraint,
+    remove_at: Instant,
 }
 
 pub struct ToastEngine<A>
@@ -213,6 +215,7 @@ where
                 .find(|t| t.toast.message == *toast.message)
         {
             existing.toast.increment_count();
+            existing.remove_at = Instant::now() + self.default_duration;
             // Recalculate area using display_text() so "(xN)" suffix fits
             let display = existing.toast.display_text();
             existing.area = calculate_toast_area(
@@ -247,6 +250,7 @@ where
             area: toast_area,
             position: toast.position,
             constraint: toast.constraint,
+            remove_at: Instant::now() + self.default_duration,
         });
         self.toast_area = toast_area;
 
@@ -271,13 +275,21 @@ where
         !self.toasts.is_empty()
     }
 
-    /// Hides the oldest displayed toast, if any. When using the `tokio` feature, this is typically called in response to a `ToastMessage::Hide` event, which is sent automatically when the toast duration expires.
+    /// Hides all expired toasts. When using the `tokio` feature, this is typically
+    /// called in response to a `ToastMessage::Hide` event. Stale events (for toasts
+    /// whose lifetime was extended via deduplication) are safely no-ops.
     pub fn hide_toast(&mut self) {
-        if self.toasts.is_empty() {
-            return;
+        self.purge_expired();
+    }
+
+    /// Removes all toasts whose display duration has elapsed.
+    pub fn purge_expired(&mut self) {
+        let now = Instant::now();
+        let len_before = self.toasts.len();
+        self.toasts.retain(|t| t.remove_at > now);
+        if self.toasts.len() != len_before {
+            self.recalculate_areas();
         }
-        self.toasts.remove(0);
-        self.recalculate_areas();
     }
 
     /// Sets the area for the toast engine and recalculates positions for all active toasts. This method allows you to update the area where toasts will be displayed, which can be useful if the layout of your terminal UI changes and you need to adjust the toast display area accordingly.
@@ -477,6 +489,7 @@ impl From<ToastMessage> for () {
 mod tests {
     use super::*;
     use ratatui::buffer::Buffer;
+    use std::time::Duration;
 
     fn area_80x24() -> Rect {
         Rect::new(0, 0, 80, 24)
@@ -619,12 +632,18 @@ mod tests {
 
     #[test]
     fn hide_toast_removes_oldest() {
-        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(area_80x24()).build();
+        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(area_80x24())
+            .default_duration(Duration::from_secs(3600))
+            .build();
         engine.show_toast(ToastBuilder::new("first".into()).position(ToastPosition::TopLeft));
         engine.show_toast(ToastBuilder::new("second".into()).position(ToastPosition::TopLeft));
+
+        // Only expire the oldest toast
+        engine.toasts[0].remove_at = Instant::now() - Duration::from_secs(1);
+
         engine.hide_toast();
 
-        // After hiding oldest ("first"), only "second" should remain
+        // After hiding expired toasts, only "second" should remain
         let mut buf = Buffer::empty(area_80x24());
         engine.render_ref(Rect::default(), &mut buf);
         let output = buf_to_string(&buf, area_80x24());
@@ -634,11 +653,16 @@ mod tests {
 
     #[test]
     fn hide_toast_recalculates_positions() {
-        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(area_80x24()).build();
+        let mut engine: ToastEngine<()> = ToastEngineBuilder::new(area_80x24())
+            .default_duration(Duration::from_secs(3600))
+            .build();
 
         // Show two toasts — second shifts first down
         engine.show_toast(ToastBuilder::new("top".into()).position(ToastPosition::TopLeft));
         engine.show_toast(ToastBuilder::new("bottom".into()).position(ToastPosition::TopLeft));
+
+        // Only expire the oldest toast
+        engine.toasts[0].remove_at = Instant::now() - Duration::from_secs(1);
 
         // Hide the oldest ("top") — "bottom" should move up
         engine.hide_toast();
