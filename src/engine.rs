@@ -279,7 +279,11 @@ where
     /// called in response to a `ToastMessage::Hide` event. Stale events (for toasts
     /// whose lifetime was extended via deduplication) are safely no-ops.
     pub fn hide_toast(&mut self) {
-        self.purge_expired();
+        if self.toasts.is_empty() {
+            return;
+        }
+        self.toasts.remove(0);
+        self.recalculate_areas();
     }
 
     /// Removes all toasts whose display duration has elapsed.
